@@ -78,7 +78,10 @@ python3 cfst.py -ip 104.16.1.1,172.67.5.5 -dn 2
 | `-n` | 100 | 延迟测速线程数 |
 | `-t` | 4 | 单个 IP 延迟测速次数 |
 | `-tp` | 443 | 测速端口 |
-| `-timeout` | 1.0 | 单次连接超时（秒） |
+| `-timeout` | 1.0 | 单次连接超时（秒）；下载阶段自动放宽到最少 4 秒 |
+| `-httping` | 关 | 延迟测速改为 HTTP 协议模式（用 `-url` 地址，可显示地区码） |
+| `-httping-code` | 200/301/302 | HTTPing 有效状态码，仅限一个 |
+| `-cfcolo` | 空 | 只保留指定地区码的 IP，如 `-cfcolo HKG,NRT`（仅 HTTPing 模式） |
 | `-dn` | 10 | 下载测速数量 |
 | `-dt` | 10 | 单个 IP 下载测速时长（秒） |
 | `-url` | Cloudflare 官方测速地址 | 下载测速地址（必须是 Cloudflare CDN 上的大文件） |
@@ -97,8 +100,26 @@ python3 cfst.py -ip 104.16.1.1,172.67.5.5 -dn 2
 ## 与 XIU2/CloudflareSpeedTest 的差异
 
 - 仅支持 IPv4
-- 无 HTTPing 模式、无 `-cfcolo` 地区过滤（但下载测速会显示地区码）
 - 默认下载测速地址为 Cloudflare 官方 `speed.cloudflare.com/__down`，可用 `-url` 换成任意自建 CF 测速地址
+
+## 下载测速都是 0.00？
+
+先加 `-debug` 重跑，看每个 IP 的具体报错：
+
+```sh
+python3 cfst.py -dn 5 -debug
+```
+
+常见报错对照：
+
+| 报错 | 原因与对策 |
+|---|---|
+| `handshake operation timed out` / `connection reset` | 该 IP 被针对性阻断（假墙/运营商拦截），换其他 IP；v1.1.0 起下载阶段超时已放宽到 4s |
+| `HTTP status 403` | 测速地址拒绝访问，用 `-url` 换自建测速地址 |
+| `context deadline / timeout` | 网络或 IP 问题，可适当加大 `-timeout` |
+| 延迟只有 0.xx ms | 走了代理，**关掉 Shadowrocket 等 VPN 再测** |
+
+另外 Cloudflare 公布的 IP 段包含**回源 IP**（无法对外服务，下载必为 0），属正常现象，只要 Top N 里有非零结果即可；`-sl 0.01` 可只保留能下载的 IP。
 
 ## 在其他平台
 

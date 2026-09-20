@@ -23,7 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "v1.0.0"
+VERSION = "v1.1.0"
 
 # Cloudflare 官方 IPv4 段（https://www.cloudflare.com/ips/）
 CF_CIDRS = [
@@ -96,7 +96,55 @@ def tcp_ping(ip, port, count, timeout):
         except OSError:
             pass
     avg = total / recv if recv else 0.0
-    return (ip, count, recv, avg)
+    return (ip, count, recv, avg, "N/A")
+
+
+def http_ping(ip, port, use_tls, host, path, ssl_ctx, count, timeout, valid_codes):
+    """HTTPing：完整发一次 HTTP(S) 请求，测量到响应头接收完成的耗时。"""
+    recv = 0
+    total = 0.0
+    colo = "N/A"
+    req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: cfst.py/%s\r\n"
+           "Accept: */*\r\nConnection: close\r\n\r\n" % (path, host, VERSION)).encode("ascii")
+    for _ in range(count):
+        t0 = time.perf_counter()
+        sock = None
+        try:
+            sock = socket.create_connection((ip, port), timeout=timeout)
+            sock.settimeout(timeout)
+            if use_tls:
+                sock = ssl_ctx.wrap_socket(sock, server_hostname=host)
+            sock.sendall(req)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    raise OSError("connection closed before headers")
+                buf += chunk
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            head = buf.partition(b"\r\n\r\n")[0]
+            lines = head.split(b"\r\n")
+            try:
+                code = int(lines[0].split()[1])
+            except (IndexError, ValueError):
+                raise OSError("bad status line")
+            if code not in valid_codes:
+                raise OSError("HTTP status %d" % code)
+            recv += 1
+            total += elapsed
+            for ln in lines[1:]:
+                if ln.lower().startswith(b"cf-ray:"):
+                    colo = ln.split(b"-")[-1].decode("ascii", "replace").strip()
+        except OSError:
+            pass
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    avg = total / recv if recv else 0.0
+    return (ip, count, recv, avg, colo)
 
 
 def latency_stage(ips, args):
@@ -104,10 +152,29 @@ def latency_stage(ips, args):
     done = 0
     usable = 0
     total = len(ips)
-    sprint("开始延迟测速（模式：TCP, 端口：%d, 线程：%d, 次数：%d）\n"
-           % (args.tp, args.n, args.t))
+    if args.httping:
+        scheme, rest = args.url.split("://", 1)
+        hostport, _, path = rest.partition("/")
+        path = "/" + path if path else "/"
+        host = hostport.split(":")[0]
+        use_tls = scheme == "https"
+        ssl_ctx = ssl.create_default_context()
+        valid_codes = {args.httping_code} if args.httping_code is not None else {200, 301, 302}
+        sprint("开始延迟测速（模式：HTTPing, 端口：%d, 线程：%d, 次数：%d, 地址：%s）\n"
+               % (args.tp, args.n, args.t, args.url))
+
+        def ping(ip):
+            return http_ping(ip, args.tp, use_tls, host, path, ssl_ctx,
+                             args.t, args.timeout, valid_codes)
+    else:
+        sprint("开始延迟测速（模式：TCP, 端口：%d, 线程：%d, 次数：%d）\n"
+               % (args.tp, args.n, args.t))
+
+        def ping(ip):
+            return tcp_ping(ip, args.tp, args.t, args.timeout)
+
     with ThreadPoolExecutor(max_workers=args.n) as pool:
-        futures = {pool.submit(tcp_ping, ip, args.tp, args.t, args.timeout): ip for ip in ips}
+        futures = {pool.submit(ping, ip): ip for ip in ips}
         for fut in as_completed(futures):
             r = fut.result()
             done += 1
@@ -123,7 +190,7 @@ def latency_stage(ips, args):
 
 
 def passes_filters(r, args):
-    _, sent, recv, avg = r
+    _, sent, recv, avg, _ = r
     loss = 1.0 - recv / sent
     if loss > args.tlr:
         return False
@@ -195,11 +262,13 @@ def download_speed(ip, port, url, duration, timeout):
 def download_stage(candidates, args):
     sprint("开始下载测速（下限：%.2f MB/s, 数量：%d, 队列：%d）\n"
            % (args.sl, args.dn, len(candidates)))
+    # 下载阶段需要完成 TLS 握手 + 收响应头，1s 超时对高延迟 IP 太短
+    dl_timeout = max(args.timeout, 4.0)
     qualified = []
     for r in candidates:
         ip = r[0]
         try:
-            speed, colo = download_speed(ip, args.tp, args.url, args.dt, args.timeout)
+            speed, colo = download_speed(ip, args.tp, args.url, args.dt, dl_timeout)
         except (OSError, ssl.SSLError) as e:
             if args.debug:
                 sprint("[%s] 下载测速失败: %s\n" % (ip, e))
@@ -250,6 +319,11 @@ def build_parser():
     p.add_argument("-t", type=int, default=4, help="单个 IP 延迟测速次数（默认 4）")
     p.add_argument("-tp", type=int, default=443, help="测速端口（默认 443）")
     p.add_argument("-timeout", type=float, default=1.0, help="单次连接超时秒数（默认 1.0）")
+    p.add_argument("-httping", action="store_true", help="延迟测速模式改为 HTTP 协议（测速地址为 -url）")
+    p.add_argument("-httping-code", type=int, default=None,
+                   help="HTTPing 有效状态码，仅限一个（默认 200 301 302）")
+    p.add_argument("-cfcolo", default=None,
+                   help="匹配指定地区码，逗号分隔如 HKG,NRT,LAX（仅 HTTPing 模式可用）")
     p.add_argument("-dn", type=int, default=10, help="下载测速数量（默认 10）")
     p.add_argument("-dt", type=float, default=10.0, help="单个 IP 下载测速秒数（默认 10）")
     p.add_argument("-url", default=DEFAULT_URL, help="下载测速地址（默认 Cloudflare 官方测速）")
@@ -276,6 +350,12 @@ def main():
 
     results = latency_stage(ips, args)
     filtered = [r for r in results if passes_filters(r, args)]
+    if args.cfcolo:
+        colos = {c.strip().upper() for c in args.cfcolo.split(",") if c.strip()}
+        if not args.httping:
+            sprint("注意：-cfcolo 仅在 HTTPing 模式下有效，已忽略。\n")
+        else:
+            filtered = [r for r in filtered if r[4].upper() in colos]
     if not filtered:
         sprint("没有找到满足条件的 IP。\n")
         return
