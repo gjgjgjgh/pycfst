@@ -23,7 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "v1.1.0"
+VERSION = "v1.2.0"
 
 # Cloudflare 官方 IPv4 段（https://www.cloudflare.com/ips/）
 CF_CIDRS = [
@@ -83,9 +83,10 @@ def sample_ips(cidrs, allip):
 
 
 def tcp_ping(ip, port, count, timeout):
-    """返回 (ip, sent, recv, avg_ms)。完全超时的 avg 为 0。"""
+    """返回 (ip, sent, recv, avg_ms, colo, err)。完全超时的 avg 为 0。"""
     recv = 0
     total = 0.0
+    err = ""
     for _ in range(count):
         t0 = time.perf_counter()
         try:
@@ -93,10 +94,16 @@ def tcp_ping(ip, port, count, timeout):
             s.close()
             recv += 1
             total += (time.perf_counter() - t0) * 1000.0
-        except OSError:
-            pass
+        except OSError as e:
+            err = str(e)
     avg = total / recv if recv else 0.0
-    return (ip, count, recv, avg, "N/A")
+    return (ip, count, recv, avg, "N/A", err)
+
+
+def make_ssl_ctx():
+    # 测速场景不校验证书：a-Shell 的 Python 可能没有可用的 CA 证书库，
+    # 且测速只关心连通性/延迟/速度，不需要验证对端身份
+    return ssl._create_unverified_context()
 
 
 def http_ping(ip, port, use_tls, host, path, ssl_ctx, count, timeout, valid_codes):
@@ -104,6 +111,7 @@ def http_ping(ip, port, use_tls, host, path, ssl_ctx, count, timeout, valid_code
     recv = 0
     total = 0.0
     colo = "N/A"
+    err = ""
     req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: cfst.py/%s\r\n"
            "Accept: */*\r\nConnection: close\r\n\r\n" % (path, host, VERSION)).encode("ascii")
     for _ in range(count):
@@ -135,8 +143,8 @@ def http_ping(ip, port, use_tls, host, path, ssl_ctx, count, timeout, valid_code
             for ln in lines[1:]:
                 if ln.lower().startswith(b"cf-ray:"):
                     colo = ln.split(b"-")[-1].decode("ascii", "replace").strip()
-        except OSError:
-            pass
+        except OSError as e:
+            err = str(e)
         finally:
             if sock is not None:
                 try:
@@ -144,7 +152,7 @@ def http_ping(ip, port, use_tls, host, path, ssl_ctx, count, timeout, valid_code
                 except OSError:
                     pass
     avg = total / recv if recv else 0.0
-    return (ip, count, recv, avg, colo)
+    return (ip, count, recv, avg, colo, err)
 
 
 def latency_stage(ips, args):
@@ -158,14 +166,16 @@ def latency_stage(ips, args):
         path = "/" + path if path else "/"
         host = hostport.split(":")[0]
         use_tls = scheme == "https"
-        ssl_ctx = ssl.create_default_context()
+        ssl_ctx = make_ssl_ctx()
         valid_codes = {args.httping_code} if args.httping_code is not None else {200, 301, 302}
+        # HTTPing 需要 TLS 握手 + 收响应头（约 3~4 个 RTT），1s 超时对高延迟 IP 太短
+        ping_timeout = max(args.timeout, 4.0)
         sprint("开始延迟测速（模式：HTTPing, 端口：%d, 线程：%d, 次数：%d, 地址：%s）\n"
                % (args.tp, args.n, args.t, args.url))
 
         def ping(ip):
             return http_ping(ip, args.tp, use_tls, host, path, ssl_ctx,
-                             args.t, args.timeout, valid_codes)
+                             args.t, ping_timeout, valid_codes)
     else:
         sprint("开始延迟测速（模式：TCP, 端口：%d, 线程：%d, 次数：%d）\n"
                % (args.tp, args.n, args.t))
@@ -173,6 +183,7 @@ def latency_stage(ips, args):
         def ping(ip):
             return tcp_ping(ip, args.tp, args.t, args.timeout)
 
+    err_stats = {}
     with ThreadPoolExecutor(max_workers=args.n) as pool:
         futures = {pool.submit(ping, ip): ip for ip in ips}
         for fut in as_completed(futures):
@@ -181,16 +192,23 @@ def latency_stage(ips, args):
             if r[2] > 0:
                 usable += 1
                 results.append(r)
+            elif args.debug and r[5]:
+                key = r[5][:60]
+                err_stats[key] = err_stats.get(key, 0) + 1
             if done % 25 == 0 or done == total:
                 sprint("\r进度: %d / %d  可用: %d   " % (done, total, usable))
     sprint("\n")
+    if args.debug and err_stats:
+        sprint("失败原因统计（Top 5）：\n")
+        for reason, cnt in sorted(err_stats.items(), key=lambda kv: -kv[1])[:5]:
+            sprint("  [%d 次] %s\n" % (cnt, reason))
     # 丢包率越低越优先，其次平均延迟（与 CFST 排序思路一致）
     results.sort(key=lambda r: (1.0 - r[2] / r[1], r[3]))
     return results
 
 
 def passes_filters(r, args):
-    _, sent, recv, avg, _ = r
+    sent, recv, avg = r[1], r[2], r[3]
     loss = 1.0 - recv / sent
     if loss > args.tlr:
         return False
@@ -212,8 +230,7 @@ def download_speed(ip, port, url, duration, timeout):
     try:
         sock.settimeout(timeout)
         if use_tls:
-            ctx = ssl.create_default_context()
-            sock = ctx.wrap_socket(sock, server_hostname=host)
+            sock = make_ssl_ctx().wrap_socket(sock, server_hostname=host)
         req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: cfst.py/%s\r\n"
                "Accept: */*\r\n\r\n" % (path, host, VERSION))
         sock.sendall(req.encode("ascii"))
@@ -287,8 +304,8 @@ def download_stage(candidates, args):
 
 
 def latency_only_rows(results):
-    rows = [(ip, sent, recv, 1.0 - recv / sent, avg, 0.0, "N/A")
-            for (ip, sent, recv, avg) in results]
+    rows = [(r[0], r[1], r[2], 1.0 - r[2] / r[1], r[3], 0.0, r[4])
+            for r in results]
     rows.sort(key=lambda x: x[4])
     return rows
 
