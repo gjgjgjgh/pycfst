@@ -26,6 +26,20 @@ cd ~/Documents
 curl -L -O https://raw.githubusercontent.com/gjgjgjgh/pycfst/main/cfst.py
 ```
 
+国内网络无法访问 raw.githubusercontent.com 时，换用以下镜像之一：
+
+```sh
+# jsDelivr CDN（推荐）
+curl -L -o cfst.py https://cdn.jsdelivr.net/gh/gjgjgjgh/pycfst@main/cfst.py
+
+# jsDelivr 备用节点
+curl -L -o cfst.py https://fastly.jsdelivr.net/gh/gjgjgjgh/pycfst@main/cfst.py
+curl -L -o cfst.py https://gcore.jsdelivr.net/gh/gjgjgjgh/pycfst@main/cfst.py
+
+# GitHub 代理镜像
+curl -L -o cfst.py https://ghfast.top/https://raw.githubusercontent.com/gjgjgjgh/pycfst/main/cfst.py
+```
+
 （文件会出现在「文件」APP → 我的 iPhone → a-Shell 文件夹中）
 
 ### 3. 运行测速
