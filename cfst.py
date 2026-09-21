@@ -23,7 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "v1.2.0"
+VERSION = "v1.2.1"
 
 # Cloudflare 官方 IPv4 段（https://www.cloudflare.com/ips/）
 CF_CIDRS = [
@@ -389,6 +389,10 @@ def main():
     if args.o.strip():
         write_csv(rows, args.o)
         sprint("完整测速结果已写入 %s\n" % args.o)
+    if args.p > 0:
+        sprint("Top %d IP（每行一个，可直接复制）：\n" % min(args.p, len(rows)))
+        for r in rows[:args.p]:
+            sprint(r[0] + "\n")
 
 
 if __name__ == "__main__":
