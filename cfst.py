@@ -167,7 +167,10 @@ def latency_stage(ips, args):
         host = hostport.split(":")[0]
         use_tls = scheme == "https"
         ssl_ctx = make_ssl_ctx()
-        valid_codes = {args.httping_code} if args.httping_code is not None else {200, 301, 302}
+        if args.httping_code is not None:
+            valid_codes = {int(c) for c in str(args.httping_code).split(",") if c.strip()}
+        else:
+            valid_codes = {200, 301, 302}
         # HTTPing 需要 TLS 握手 + 收响应头（约 3~4 个 RTT），1s 超时对高延迟 IP 太短
         ping_timeout = max(args.timeout, 4.0)
         sprint("开始延迟测速（模式：HTTPing, 端口：%d, 线程：%d, 次数：%d, 地址：%s）\n"
@@ -337,8 +340,8 @@ def build_parser():
     p.add_argument("-tp", type=int, default=443, help="测速端口（默认 443）")
     p.add_argument("-timeout", type=float, default=1.0, help="单次连接超时秒数（默认 1.0）")
     p.add_argument("-httping", action="store_true", help="延迟测速模式改为 HTTP 协议（测速地址为 -url）")
-    p.add_argument("-httping-code", type=int, default=None,
-                   help="HTTPing 有效状态码，仅限一个（默认 200 301 302）")
+    p.add_argument("-httping-code", default=None,
+                   help="HTTPing 有效状态码，逗号分隔如 200,301（默认 200 301 302）")
     p.add_argument("-cfcolo", default=None,
                    help="匹配指定地区码，逗号分隔如 HKG,NRT,LAX（仅 HTTPing 模式可用）")
     p.add_argument("-dn", type=int, default=10, help="下载测速数量（默认 10）")
