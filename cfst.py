@@ -23,7 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "v1.2.1"
+VERSION = "v1.2.2"
 
 # Cloudflare 官方 IPv4 段（https://www.cloudflare.com/ips/）
 CF_CIDRS = [
