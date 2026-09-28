@@ -23,7 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "v1.2.2"
+VERSION = "v1.3.0"
 
 # Cloudflare 官方 IPv4 段（https://www.cloudflare.com/ips/）
 CF_CIDRS = [
@@ -44,6 +44,8 @@ CF_CIDRS = [
 ]
 
 DEFAULT_URL = "https://speed.cloudflare.com/__down?bytes=200000000"
+# 用户自建 CF 站点：用真实业务域名做 HTTPing/下载测速，验证结果才等于实际可用性
+DEFAULT_HTTPING_URL = "https://supconit.cc.cd/"
 
 _print_lock = threading.Lock()
 
@@ -155,37 +157,12 @@ def http_ping(ip, port, use_tls, host, path, ssl_ctx, count, timeout, valid_code
     return (ip, count, recv, avg, colo, err)
 
 
-def latency_stage(ips, args):
+def run_ping_pool(ips, ping, args, label):
+    """并发执行 ping 函数，返回 (可用结果列表, 失败原因统计)。"""
     results = []
     done = 0
     usable = 0
     total = len(ips)
-    if args.httping:
-        scheme, rest = args.url.split("://", 1)
-        hostport, _, path = rest.partition("/")
-        path = "/" + path if path else "/"
-        host = hostport.split(":")[0]
-        use_tls = scheme == "https"
-        ssl_ctx = make_ssl_ctx()
-        if args.httping_code is not None:
-            valid_codes = {int(c) for c in str(args.httping_code).split(",") if c.strip()}
-        else:
-            valid_codes = {200, 301, 302}
-        # HTTPing 需要 TLS 握手 + 收响应头（约 3~4 个 RTT），1s 超时对高延迟 IP 太短
-        ping_timeout = max(args.timeout, 4.0)
-        sprint("开始延迟测速（模式：HTTPing, 端口：%d, 线程：%d, 次数：%d, 地址：%s）\n"
-               % (args.tp, args.n, args.t, args.url))
-
-        def ping(ip):
-            return http_ping(ip, args.tp, use_tls, host, path, ssl_ctx,
-                             args.t, ping_timeout, valid_codes)
-    else:
-        sprint("开始延迟测速（模式：TCP, 端口：%d, 线程：%d, 次数：%d）\n"
-               % (args.tp, args.n, args.t))
-
-        def ping(ip):
-            return tcp_ping(ip, args.tp, args.t, args.timeout)
-
     err_stats = {}
     with ThreadPoolExecutor(max_workers=args.n) as pool:
         futures = {pool.submit(ping, ip): ip for ip in ips}
@@ -195,17 +172,91 @@ def latency_stage(ips, args):
             if r[2] > 0:
                 usable += 1
                 results.append(r)
-            elif args.debug and r[5]:
+            elif r[5]:
                 key = r[5][:60]
                 err_stats[key] = err_stats.get(key, 0) + 1
             if done % 25 == 0 or done == total:
-                sprint("\r进度: %d / %d  可用: %d   " % (done, total, usable))
+                sprint("\r%s进度: %d / %d  可用: %d   " % (label, done, total, usable))
     sprint("\n")
-    if args.debug and err_stats:
-        sprint("失败原因统计（Top 5）：\n")
-        for reason, cnt in sorted(err_stats.items(), key=lambda kv: -kv[1])[:5]:
-            sprint("  [%d 次] %s\n" % (cnt, reason))
+    return results, err_stats
+
+
+def print_err_stats(err_stats):
+    if not err_stats:
+        return
+    sprint("失败原因统计（Top 5）：\n")
+    for reason, cnt in sorted(err_stats.items(), key=lambda kv: -kv[1])[:5]:
+        sprint("  [%d 次] %s\n" % (cnt, reason))
+
+
+def parse_http_url(url):
+    """拆 URL 为 (use_tls, host, path)。"""
+    scheme, rest = url.split("://", 1)
+    hostport, _, path = rest.partition("/")
+    path = "/" + path if path else "/"
+    host = hostport.split(":")[0]
+    return scheme == "https", host, path
+
+
+def latency_stage(ips, args):
+    if args.httping:
+        return latency_stage_httping(ips, args)
+
+    sprint("开始延迟测速（模式：TCP, 端口：%d, 线程：%d, 次数：%d）\n"
+           % (args.tp, args.n, args.t))
+
+    def ping(ip):
+        return tcp_ping(ip, args.tp, args.t, args.timeout)
+
+    results, err_stats = run_ping_pool(ips, ping, args, "")
+    if args.debug:
+        print_err_stats(err_stats)
     # 丢包率越低越优先，其次平均延迟（与 CFST 排序思路一致）
+    results.sort(key=lambda r: (1.0 - r[2] / r[1], r[3]))
+    return results
+
+
+def latency_stage_httping(ips, args):
+    use_tls, host, path = parse_http_url(args.hurl)
+    ssl_ctx = make_ssl_ctx()
+    if args.httping_code is not None:
+        valid_codes = {int(c) for c in str(args.httping_code).split(",") if c.strip()}
+    else:
+        valid_codes = {200, 301, 302}
+    # HTTPing 需要 TLS 握手 + 收响应头（约 3~4 个 RTT），1s 超时对高延迟 IP 太短
+    ping_timeout = max(args.timeout, 4.0)
+
+    if args.t2:
+        # 两阶段：先 TCP 单次快速粗筛，只对通者做完整 HTTPing 精筛
+        sprint("阶段 1/2：TCP 粗筛（端口：%d, 线程：%d）\n" % (args.tp, args.n))
+
+        def tcp_probe(ip):
+            return tcp_ping(ip, args.tp, 1, args.timeout)
+
+        passed, _ = run_ping_pool(ips, tcp_probe, args, "粗筛")
+        passed.sort(key=lambda r: r[3])
+        if len(passed) > args.t2n:
+            passed = passed[:args.t2n]
+        candidates = [r[0] for r in passed]
+        sprint("阶段 2/2：HTTPing 精筛（%d 个候选, 地址：%s, 次数：%d）\n"
+               % (len(candidates), args.hurl, args.t))
+
+        def ping(ip):
+            return http_ping(ip, args.tp, use_tls, host, path, ssl_ctx,
+                             args.t, ping_timeout, valid_codes)
+
+        results, err_stats = run_ping_pool(candidates, ping, args, "精筛")
+        print_err_stats(err_stats)  # HTTPing 失败原因（SNI 拦截/超时等）始终展示
+    else:
+        sprint("开始延迟测速（模式：HTTPing, 端口：%d, 线程：%d, 次数：%d, 地址：%s）\n"
+               % (args.tp, args.n, args.t, args.hurl))
+
+        def ping(ip):
+            return http_ping(ip, args.tp, use_tls, host, path, ssl_ctx,
+                             args.t, ping_timeout, valid_codes)
+
+        results, err_stats = run_ping_pool(ips, ping, args, "")
+        print_err_stats(err_stats)
     results.sort(key=lambda r: (1.0 - r[2] / r[1], r[3]))
     return results
 
@@ -222,11 +273,7 @@ def passes_filters(r, args):
 
 def download_speed(ip, port, url, duration, timeout):
     """直连 IP 发 HTTP(S) 请求（SNI/Host 用域名），返回 (MB/s, colo)。"""
-    scheme, rest = url.split("://", 1)
-    hostport, _, path = rest.partition("/")
-    path = "/" + path if path else "/"
-    host = hostport.split(":")[0]
-    use_tls = scheme == "https"
+    use_tls, host, path = parse_http_url(url)
 
     colo = "N/A"
     sock = socket.create_connection((ip, port), timeout=timeout)
@@ -339,14 +386,21 @@ def build_parser():
     p.add_argument("-t", type=int, default=4, help="单个 IP 延迟测速次数（默认 4）")
     p.add_argument("-tp", type=int, default=443, help="测速端口（默认 443）")
     p.add_argument("-timeout", type=float, default=1.0, help="单次连接超时秒数（默认 1.0）")
-    p.add_argument("-httping", action="store_true", help="延迟测速模式改为 HTTP 协议（测速地址为 -url）")
+    p.add_argument("-httping", action="store_true", help="延迟测速模式改为 HTTP 协议（测速地址为 -hurl）")
+    p.add_argument("-t2", action="store_true",
+                   help="两阶段延迟测速：TCP 粗筛后再 HTTPing 精筛（仅 HTTPing 模式，推荐）")
+    p.add_argument("-t2n", type=int, default=100,
+                   help="两阶段模式进入精筛的候选数量（默认 100，按 TCP 延迟取最优）")
     p.add_argument("-httping-code", default=None,
                    help="HTTPing 有效状态码，逗号分隔如 200,301（默认 200 301 302）")
     p.add_argument("-cfcolo", default=None,
                    help="匹配指定地区码，逗号分隔如 HKG,NRT,LAX（仅 HTTPing 模式可用）")
     p.add_argument("-dn", type=int, default=10, help="下载测速数量（默认 10）")
     p.add_argument("-dt", type=float, default=10.0, help="单个 IP 下载测速秒数（默认 10）")
-    p.add_argument("-url", default=DEFAULT_URL, help="下载测速地址（默认 Cloudflare 官方测速）")
+    p.add_argument("-url", default=DEFAULT_URL,
+                   help="下载测速地址（默认 Cloudflare 官方测速；HTTPing 时建议用 -hurl 指定自己域名）")
+    p.add_argument("-hurl", default=DEFAULT_HTTPING_URL,
+                   help="HTTPing 测速地址（默认内置自建域名，建议改成你实际使用的 CF 域名）")
     p.add_argument("-tl", type=float, default=9999.0, help="平均延迟上限 ms（默认 9999）")
     p.add_argument("-tll", type=float, default=0.0, help="平均延迟下限 ms（默认 0）")
     p.add_argument("-tlr", type=float, default=1.0, help="丢包几率上限 0.00~1.00（默认 1.00）")
