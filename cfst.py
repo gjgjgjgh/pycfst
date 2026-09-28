@@ -138,7 +138,7 @@ def http_ping(ip, port, use_tls, host, path, ssl_ctx, count, timeout, valid_code
                 code = int(lines[0].split()[1])
             except (IndexError, ValueError):
                 raise OSError("bad status line")
-            if code not in valid_codes:
+            if code >= 400 and valid_codes is not None and code not in valid_codes:
                 raise OSError("HTTP status %d" % code)
             recv += 1
             total += elapsed
@@ -227,7 +227,11 @@ def latency_stage_httping(ips, args):
     use_tls, host, path = parse_http_url(httping_url)
     ssl_ctx = make_ssl_ctx()
     if args.httping_code is not None:
-        valid_codes = {int(c) for c in str(args.httping_code).split(",") if c.strip()}
+        # any = 只要收到 HTTP 响应就算通（代理节点优选场景：状态码无所谓，TLS+连通即有效）
+        if str(args.httping_code).strip().lower() == "any":
+            valid_codes = None
+        else:
+            valid_codes = {int(c) for c in str(args.httping_code).split(",") if c.strip()}
     else:
         valid_codes = {200, 301, 302}
     # HTTPing 需要 TLS 握手 + 收响应头（约 3~4 个 RTT），1s 超时对高延迟 IP 太短
@@ -399,7 +403,7 @@ def build_parser():
     p.add_argument("-t2n", type=int, default=100,
                    help="两阶段模式进入精筛的候选数量（默认 100，按 TCP 延迟取最优）")
     p.add_argument("-httping-code", default=None,
-                   help="HTTPing 有效状态码，逗号分隔如 200,301（默认 200 301 302）")
+                   help="HTTPing 有效状态码，逗号分隔如 200,301；any 表示收到响应即算通（默认 200 301 302）")
     p.add_argument("-cfcolo", default=None,
                    help="匹配指定地区码，逗号分隔如 HKG,NRT,LAX（仅 HTTPing 模式可用）")
     p.add_argument("-dn", type=int, default=10, help="下载测速数量（默认 10）")
