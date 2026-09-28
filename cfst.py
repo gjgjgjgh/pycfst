@@ -217,7 +217,14 @@ def latency_stage(ips, args):
 
 
 def latency_stage_httping(ips, args):
-    use_tls, host, path = parse_http_url(args.hurl)
+    # 优先级：-hurl > -url（用户显式传入时）> 内置默认域名
+    if args.hurl is not None:
+        httping_url = args.hurl
+    elif args.url != DEFAULT_URL:
+        httping_url = args.url
+    else:
+        httping_url = DEFAULT_HTTPING_URL
+    use_tls, host, path = parse_http_url(httping_url)
     ssl_ctx = make_ssl_ctx()
     if args.httping_code is not None:
         valid_codes = {int(c) for c in str(args.httping_code).split(",") if c.strip()}
@@ -239,7 +246,7 @@ def latency_stage_httping(ips, args):
             passed = passed[:args.t2n]
         candidates = [r[0] for r in passed]
         sprint("阶段 2/2：HTTPing 精筛（%d 个候选, 地址：%s, 次数：%d）\n"
-               % (len(candidates), args.hurl, args.t))
+               % (len(candidates), httping_url, args.t))
 
         def ping(ip):
             return http_ping(ip, args.tp, use_tls, host, path, ssl_ctx,
@@ -249,7 +256,7 @@ def latency_stage_httping(ips, args):
         print_err_stats(err_stats)  # HTTPing 失败原因（SNI 拦截/超时等）始终展示
     else:
         sprint("开始延迟测速（模式：HTTPing, 端口：%d, 线程：%d, 次数：%d, 地址：%s）\n"
-               % (args.tp, args.n, args.t, args.hurl))
+               % (args.tp, args.n, args.t, httping_url))
 
         def ping(ip):
             return http_ping(ip, args.tp, use_tls, host, path, ssl_ctx,
@@ -399,8 +406,8 @@ def build_parser():
     p.add_argument("-dt", type=float, default=10.0, help="单个 IP 下载测速秒数（默认 10）")
     p.add_argument("-url", default=DEFAULT_URL,
                    help="下载测速地址（默认 Cloudflare 官方测速；HTTPing 时建议用 -hurl 指定自己域名）")
-    p.add_argument("-hurl", default=DEFAULT_HTTPING_URL,
-                   help="HTTPing 测速地址（默认内置自建域名，建议改成你实际使用的 CF 域名）")
+    p.add_argument("-hurl", default=None,
+                   help="HTTPing 测速地址（优先于 -url；都不传时用内置自建域名）")
     p.add_argument("-tl", type=float, default=9999.0, help="平均延迟上限 ms（默认 9999）")
     p.add_argument("-tll", type=float, default=0.0, help="平均延迟下限 ms（默认 0）")
     p.add_argument("-tlr", type=float, default=1.0, help="丢包几率上限 0.00~1.00（默认 1.00）")
